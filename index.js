@@ -939,6 +939,7 @@ function registerWebhook(path, config, sourceName) {
 }
 
 registerWebhook("/webhook", configA, "A");
+registerWebhook("/webhook-a", configA, "A");
 if (hasLineB) registerWebhook("/webhook-b", configB, "B");
 
 async function replyText(clientObj, replyToken, text) {
