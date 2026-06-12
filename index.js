@@ -1,0 +1,2196 @@
+require("dotenv").config();
+
+const express = require("express");
+const line = require("@line/bot-sdk");
+const { handleDriverAssistant } = require("./driverAssistant");
+
+let supabaseModule = require("./config/supabase");
+const supabase = supabaseModule.supabase || supabaseModule;
+
+const {
+  createOrder,
+  addDriverReport,
+  decideWinner,
+  getFirstDriverReport,
+  getOrderByCodeAndAddress,
+  getOrderByCode,
+  lockReservationWinner,
+  getReservationLock,
+  getLatestCustomerOrder,
+  upsertCustomerPreference,
+  getCustomerPreference,
+  resetOrderForReDispatch,
+  getOpenOrdersForRefresh,
+  markOrderRefreshed,
+  cancelLatestCustomerOrder,
+  assignWinnerDriver,
+  overrideDriver,
+  upsertDriverCurrentOrder,
+  getBotSetting,
+  setBotSetting
+} = require("./services/orderService");
+
+const app = express();
+
+app.use("/admin", express.urlencoded({ extended: true }));
+app.use("/admin", express.json());
+
+if (!process.env.BOT1_CHANNEL_ACCESS_TOKEN) throw new Error("Missing BOT1_CHANNEL_ACCESS_TOKEN");
+if (!process.env.BOT1_CHANNEL_SECRET) throw new Error("Missing BOT1_CHANNEL_SECRET");
+if (!process.env.DRIVER_GROUP_ID) throw new Error("Missing DRIVER_GROUP_ID");
+
+const DRIVER_GROUP_ID = process.env.DRIVER_GROUP_ID;
+const DRIVER_GROUP_SOURCE = "A";
+const GOOGLE_API_ENABLED = false;
+
+let BOT_ENABLED = true;
+let REFRESH_ENABLED = true;
+
+const COMPETE_DIFF_MINUTES = 3;
+const OVERRIDE_DIFF_MINUTES = 7;
+
+const REFRESH_INTERVAL_MS = 60000;
+const REFRESH_BATCH_SIZE = 5;
+const REFRESH_ORDER_DELAY_MS = 8000; // 每張刷單間隔8秒，降低429
+const MESSAGE_WORKER_INTERVAL_MS = 1200;
+const MESSAGE_JOB_BATCH_SIZE = 5;
+const MAX_RETRY = 5;
+const RESPRAY_CHECK_INTERVAL_MS = 30 * 1000;
+const REPAIR_DECISION_INTERVAL_MS = 30 * 1000;
+const DECISION_STUCK_MS = 20 * 1000;
+const BOT_FAIL_HOLD_MS = 5 * 60 * 1000; // Bot壞掉時，訊息保留5分鐘後再試
+
+const PRIORITY_OVERRIDE_SPRAY = 2;
+const PRIORITY_CUSTOMER = 3;
+const PRIORITY_COUNTDOWN_SPRAY = 4;
+const PRIORITY_NEW_ORDER = 5;
+const PRIORITY_REFRESH = 9;
+
+const clients = new Map();
+const pendingReservationChanges = new Map();
+const reservationWinners = new Map();
+const reservationPending5 = new Map();
+const reservationReadyWinners = new Map();
+const processingOrders = new Set();
+const refreshingOrders = new Set();
+const decidingOrders = new Set();
+const customerCooldown = new Map();
+const driverCooldown = new Map();
+const blacklistCustomers = new Set();
+const cancelFees = new Map();
+
+let totalOrders = 0;
+let total429 = 0;
+let totalCanceled = 0;
+let totalAssigned = 0;
+let messageWorkerRunning = false;
+
+function delay(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function logSystemError(source, err) {
+  try {
+    const message =
+      err?.message ||
+      err?.error_description ||
+      String(err);
+
+    const detail =
+      typeof err === "object"
+        ? JSON.stringify(err)
+        : String(err);
+
+    await supabase.from("system_errors").insert([{
+      source,
+      message,
+      detail
+    }]);
+  } catch (logErr) {
+    console.error("logSystemError failed:", logErr);
+  }
+}
+
+function registerClient(sourceName, channelAccessToken, channelSecret) {
+  const config = { channelAccessToken, channelSecret };
+  clients.set(sourceName, { client: new line.Client(config), config });
+  return config;
+}
+
+function getClientBySource(sourceName) {
+  const item = clients.get(sourceName);
+  if (!item) throw new Error(`Unknown LINE source: ${sourceName}`);
+  return item.client;
+}
+
+const configA = registerClient(
+  "A",
+  process.env.BOT1_CHANNEL_ACCESS_TOKEN,
+  process.env.BOT1_CHANNEL_SECRET
+);
+
+const hasLineB = !!process.env.BOT2_CHANNEL_ACCESS_TOKEN && !!process.env.BOT2_CHANNEL_SECRET;
+let configB = null;
+
+if (hasLineB) {
+  configB = registerClient("B", process.env.BOT2_CHANNEL_ACCESS_TOKEN, process.env.BOT2_CHANNEL_SECRET);
+  console.log("官方B 已啟用");
+} else {
+  console.log("官方B 尚未啟用");
+}
+
+function getErrorStatus(err) {
+  return err?.statusCode || err?.originalError?.response?.status;
+}
+
+function getErrorData(err) {
+  return err?.originalError?.response?.data || err.message;
+}
+
+function getArrivalTimeMs(reportTime, minutes) {
+  return new Date(reportTime).getTime() + Number(minutes) * 60 * 1000;
+}
+
+function detectPaymentMethod(text) {
+  const rules = [
+    { keywords: ["客下街口", "下街口", "街口"], value: "客下街口" },
+    { keywords: ["客下轉帳"], value: "客下轉帳" },
+    { keywords: ["轉帳"], value: "轉帳" },
+    { keywords: ["現金"], value: "現金" }
+  ];
+
+  for (const rule of rules) {
+    for (const keyword of rule.keywords) {
+      if (text.includes(keyword)) return { keyword, value: rule.value };
+    }
+  }
+
+  return null;
+}
+
+function removePaymentKeyword(text, keyword) {
+  return text.replace(keyword, "").replace(/\s+/g, " ").trim();
+}
+
+function normalizeReportedAddress(address) {
+  return address
+    .replace(/客下街口/g, "")
+    .replace(/客下轉帳/g, "")
+    .replace(/轉帳/g, "")
+    .replace(/現金/g, "")
+    .replace(/代收取消費\d+/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function chineseNumberToDigit(text) {
+  const map = {
+    一: 1,
+    二: 2,
+    兩: 2,
+    三: 3,
+    四: 4,
+    五: 5,
+    六: 6,
+    七: 7,
+    八: 8,
+    九: 9,
+    十: 10
+  };
+
+  return String(text).replace(/[一二兩三四五六七八九十]/g, v => String(map[v] || v));
+}
+
+function parseErrandOrder(text) {
+  const lines = text
+    .split(/\n+/)
+    .map(v => v.trim())
+    .filter(Boolean);
+
+  const fullText = lines.join(" ");
+
+  const isErrand =
+    fullText.includes("跑腿") ||
+    fullText.includes("代墊") ||
+    fullText.includes("送到") ||
+    fullText.includes("買");
+
+  if (!isErrand) return null;
+
+  const timeMatch = fullText.match(/(\d{1,2})[.:：](\d{2})/);
+
+  const reserveTime = timeMatch
+    ? `${timeMatch[1].padStart(2, "0")}:${timeMatch[2]}`
+    : "";
+
+  const needAdvance = fullText.includes("需代墊")
+    ? "需代墊"
+    : "不需代墊";
+
+  let payment = "現金";
+
+  if (fullText.includes("街口")) payment = "街口";
+  if (fullText.includes("轉帳")) payment = "轉帳";
+
+  const addressLine =
+    lines.find(line =>
+      /市|縣|區|路|街|巷|號/.test(line)
+    ) || "";
+
+  let pickupLine =
+    lines.find(line =>
+      line.includes("百貨") ||
+      line.includes("商場") ||
+      line.includes("快閃櫃") ||
+      line.includes("店") ||
+      line.includes("餐廳")
+    ) || "";
+
+  pickupLine = pickupLine
+    .replace(/^\d{1,2}[.:：]\d{2}/, "")
+    .trim();
+
+  const taskLines = lines.filter(line => {
+    if (line.includes("跑腿")) return false;
+    if (line === "需代墊") return false;
+    if (line === "不需代墊") return false;
+    if (line === "街口") return false;
+    if (line === "轉帳") return false;
+    if (line === "現金") return false;
+    if (line === addressLine) return false;
+    if (line === pickupLine) return false;
+    if (/^\d{1,2}[.:：]\d{2}/.test(line)) return false;
+    return true;
+  });
+
+  const task = taskLines.join("").replace(/對?送到/g, "").trim();
+
+  const actionText =
+    `${pickupLine}買${task}`.replace(/\s+/g, "");
+
+  const parts = [];
+
+  parts.push("跑腿");
+
+  if (reserveTime) {
+    parts.push(reserveTime);
+  }
+
+  parts.push(needAdvance);
+  parts.push(actionText || "跑腿服務");
+  parts.push(addressLine || "未提供地址");
+  parts.push(payment);
+
+  return parts.join("/");
+}
+
+function parseDriverServiceOrder(text) {
+  const clean = String(text).trim();
+
+  if (!clean.includes("代駕")) return null;
+
+  const location = clean
+    .replace(/^代駕[:：\s]*/, "")
+    .replace(/代駕/g, "")
+    .replace(/\n+/g, " ")
+    .replace(/\s+/g, "")
+    .trim();
+
+  if (!location) return null;
+
+  return `代駕/${location}`;
+}
+
+async function enqueueMessage({ toId, sourceName = "A", priority = 5, message, orderId = null, jobKey = null }) {
+  const payload = {
+    to_id: toId,
+    source_name: sourceName,
+    priority,
+    message_json: message,
+    status: "pending",
+    retry_count: 0,
+    next_retry_at: new Date().toISOString(),
+    order_id: orderId,
+    job_key: jobKey
+  };
+
+  let result;
+
+  if (jobKey) {
+    result = await supabase
+      .from("message_jobs")
+      .upsert(payload, {
+        onConflict: "job_key",
+        ignoreDuplicates: false
+      });
+  } else {
+    result = await supabase
+      .from("message_jobs")
+      .insert(payload);
+  }
+
+  if (result.error) throw result.error;
+}
+
+async function queueRefreshText(to, text, source = "A") {
+  if (!REFRESH_ENABLED) return;
+  return enqueueMessage({
+    toId: to,
+    sourceName: source,
+    priority: PRIORITY_REFRESH,
+    message: { type: "text", text }
+  });
+}
+
+async function queueGroupMention(userId, text, orderId = null, priority = PRIORITY_COUNTDOWN_SPRAY) {
+  return enqueueMessage({
+    toId: DRIVER_GROUP_ID,
+    sourceName: DRIVER_GROUP_SOURCE,
+    priority,
+    orderId,
+    jobKey: orderId ? `spray:${orderId}:${userId}:${text}` : null,
+    message: {
+      type: "textV2",
+      text: "{driver} " + text,
+      substitution: {
+        driver: {
+          type: "mention",
+          mentionee: { type: "user", userId }
+        }
+      }
+    }
+  });
+}
+
+async function geocodeAddress(address) {
+  if (!process.env.GOOGLE_MAPS_API_KEY) return null;
+
+  const url =
+    "https://maps.googleapis.com/maps/api/geocode/json?address=" +
+    encodeURIComponent(address) +
+    "&region=tw&key=" +
+    process.env.GOOGLE_MAPS_API_KEY;
+
+  const response = await fetch(url);
+  const result = await response.json();
+
+  if (
+    result.status !== "OK" ||
+    !result.results ||
+    !result.results[0]
+  ) {
+    console.error("geocode failed:", result.status, address);
+    return null;
+  }
+
+  return result.results[0].geometry.location;
+}
+
+function cleanAssistantOrderCode(orderCode) {
+  return String(orderCode || "")
+    .replace("#", "")
+    .replaceAll("/", "")
+    .trim()
+    .toUpperCase();
+}
+
+async function closeDriverAssistantOrder(orderCode) {
+  const cleanCode = cleanAssistantOrderCode(orderCode);
+
+  if (!cleanCode) return;
+
+  await supabase
+    .from("driver_assistant_orders")
+    .update({
+      status: "assigned",
+      closed_reason: "噴",
+      closed_at: new Date().toISOString(),
+      updated_at: new Date().toISOString()
+    })
+    .eq("group_id", DRIVER_GROUP_ID)
+    .eq("order_code", cleanCode);
+}
+
+async function markSprayConfirmed(orderId) {
+  if (!orderId) return;
+
+  await supabase
+    .from("orders")
+    .update({ spray_confirmed: true })
+    .eq("order_id", orderId);
+}
+
+async function markCustomerDispatchNotified(orderId) {
+  if (!orderId) return;
+
+  await supabase
+    .from("orders")
+    .update({ customer_dispatch_notified: true })
+    .eq("order_id", orderId);
+}
+
+async function pushCustomerDispatch(customerLineId, plate, minutes, source = "A") {
+  let messageText = "";
+
+  if (minutes === "準") {
+    messageText =
+`司機已出發
+車牌:${plate}
+準時抵達`;
+  }
+  else if (
+    typeof minutes === "string" &&
+    minutes.startsWith("晚")
+  ) {
+    const lateMinutes = minutes.replace("晚", "");
+
+    messageText =
+`司機已出發
+車牌:${plate}
+預計晚${lateMinutes}分鐘抵達`;
+  }
+  else {
+    messageText =
+`司機已出發
+車牌:${plate}
+約${minutes}分鐘抵達`;
+  }
+
+  return enqueueMessage({
+    toId: customerLineId,
+    sourceName: source,
+    priority: PRIORITY_CUSTOMER,
+    message: {
+      type: "text",
+      text: messageText
+    }
+  });
+}
+
+async function pushCustomerFasterDispatch(customerLineId, plate, minutes, source = "A") {
+  return enqueueMessage({
+    toId: customerLineId,
+    sourceName: source,
+    priority: PRIORITY_CUSTOMER,
+    message: {
+      type: "text",
+      text: `已幫您找到更快的司機，會提早抵達\n車牌:${plate}\n約${minutes}分鐘`
+    }
+  });
+}
+
+async function pushCustomerArrived(customerLineId, plate, source = "A") {
+  return enqueueMessage({
+    toId: customerLineId,
+    sourceName: source,
+    priority: PRIORITY_CUSTOMER,
+    message: {
+      type: "text",
+      text: `車輛已抵達\n車牌:${plate}`
+    }
+  });
+}
+
+async function pushCustomerReservationChanged(customerLineId, reservationTime, source = "A") {
+  return enqueueMessage({
+    toId: customerLineId,
+    sourceName: source,
+    priority: PRIORITY_CUSTOMER,
+    message: {
+      type: "text",
+      text: `已為您更改為預約單\n預約時間:${reservationTime}`
+    }
+  });
+}
+
+async function pushAskDriverReservationChange(order, reservationTime, paymentText = "") {
+  return enqueueMessage({
+    toId: DRIVER_GROUP_ID,
+    sourceName: DRIVER_GROUP_SOURCE,
+    priority: PRIORITY_NEW_ORDER,
+    message: {
+      type: "textV2",
+      text: `${order.order_code} ${reservationTime} ${order.address}${paymentText}\n{driver} 可不可更改`,
+      substitution: {
+        driver: {
+          type: "mention",
+          mentionee: { type: "user", userId: order.assigned_driver_line_id }
+        }
+      }
+    }
+  });
+}
+
+async function processMessageJobs() {
+  if (!BOT_ENABLED) return;
+  if (messageWorkerRunning) return;
+
+  messageWorkerRunning = true;
+
+  try {
+    const now = new Date().toISOString();
+    const staleTime = new Date(Date.now() - 2 * 60 * 1000).toISOString();
+
+    await supabase
+      .from("message_jobs")
+      .update({
+        status: "pending",
+        locked_at: null,
+        next_retry_at: new Date().toISOString(),
+        error_message: "recovered from stuck processing"
+      })
+      .eq("status", "processing")
+      .lt("locked_at", staleTime);
+
+    const { data: jobs, error } = await supabase
+      .from("message_jobs")
+      .select("*")
+      .eq("status", "pending")
+      .or(`next_retry_at.is.null,next_retry_at.lte.${now}`)
+      .order("priority", { ascending: true })
+      .order("created_at", { ascending: true })
+      .limit(MESSAGE_JOB_BATCH_SIZE);
+
+    if (error) throw error;
+    if (!jobs || jobs.length === 0) return;
+
+    for (const job of jobs) {
+      if (!BOT_ENABLED) break;
+
+      let claimed = null;
+      let lastErrorStatus = null;
+      let lastErrorData = null;
+
+      try {
+        const { data, error: claimError } = await supabase
+          .from("message_jobs")
+          .update({
+            status: "processing",
+            locked_at: new Date().toISOString()
+          })
+          .eq("id", job.id)
+          .eq("status", "pending")
+          .select("*")
+          .maybeSingle();
+
+        if (claimError) throw claimError;
+        if (!data) continue;
+
+        claimed = data;
+
+        const { data: bots, error: botError } = await supabase
+          .from("bot_accounts")
+          .select("*")
+          .eq("status", "active")
+          .eq("source_name", claimed.source_name)
+          .order("last_used_at", { ascending: true, nullsFirst: true })
+          .order("id", { ascending: true })
+          .limit(10);
+
+        if (botError) throw botError;
+        if (!bots || bots.length === 0) {
+          throw new Error("沒有可用的 active bot_accounts");
+        }
+
+        let sent = false;
+
+        for (const bot of bots) {
+          try {
+            const tempClient = new line.Client({
+              channelAccessToken: bot.channel_access_token
+            });
+
+            await tempClient.pushMessage(claimed.to_id, claimed.message_json);
+
+            await supabase
+              .from("message_jobs")
+              .update({
+                status: "sent",
+                sent_at: new Date().toISOString(),
+                locked_at: null,
+                error_message: null
+              })
+              .eq("id", claimed.id);
+
+            await supabase
+              .from("bot_accounts")
+              .update({
+                last_used_at: new Date().toISOString(),
+                last_error: null,
+                fail_count: 0
+              })
+              .eq("id", bot.id);
+
+            sent = true;
+            break;
+          } catch (err) {
+            const status = getErrorStatus(err);
+            const data = getErrorData(err);
+
+            lastErrorStatus = status;
+            lastErrorData = data;
+
+            const newFailCount = Number(bot.fail_count || 0) + 1;
+
+            const updateData = {
+              fail_count: newFailCount,
+              last_error: typeof data === "string" ? data : JSON.stringify(data)
+            };
+
+            if (newFailCount >= 10) {
+              updateData.status = "disabled";
+              updateData.disabled_at = new Date().toISOString();
+            }
+
+            await supabase
+              .from("bot_accounts")
+              .update(updateData)
+              .eq("id", bot.id);
+
+            if (status === 429) total429++;
+            continue;
+          }
+        }
+
+        if (!sent) {
+          throw {
+            statusCode: lastErrorStatus,
+            message: lastErrorData || "所有 BOT 發送失敗"
+          };
+        }
+
+        await delay(1200);
+      } catch (err) {
+        const status = err?.statusCode || getErrorStatus(err);
+        const data = err?.message || getErrorData(err);
+
+        console.error("processMessageJobs item error:", data);
+        await logSystemError("processMessageJobs:item", data);
+
+        if (status === 429) total429++;
+
+        if (claimed) {
+          const currentRetry = Number(claimed.retry_count || 0) + 1;
+
+          const retryDelayMs =
+            status === 429
+              ? 60000
+              : BOT_FAIL_HOLD_MS;
+
+          if (currentRetry >= MAX_RETRY) {
+            await supabase
+              .from("message_jobs")
+              .update({
+                status: "failed",
+                locked_at: null,
+                retry_count: currentRetry,
+                error_message:
+                  typeof data === "string"
+                    ? data
+                    : JSON.stringify(data)
+              })
+              .eq("id", claimed.id);
+
+            continue;
+          }
+
+          await supabase
+            .from("message_jobs")
+            .update({
+              status: "pending",
+              locked_at: null,
+              retry_count: currentRetry,
+              next_retry_at: new Date(Date.now() + retryDelayMs).toISOString(),
+              error_message:
+                typeof data === "string"
+                  ? data
+                  : JSON.stringify(data)
+            })
+            .eq("id", claimed.id);
+        }
+      }
+    }
+  } catch (err) {
+    console.error("processMessageJobs error:", err);
+    await logSystemError("processMessageJobs", err);
+  } finally {
+    messageWorkerRunning = false;
+  }
+}
+
+function checkCustomerCooldown(customerLineId) {
+  const last = customerCooldown.get(customerLineId);
+  if (last && Date.now() - last < 5000) return false;
+  customerCooldown.set(customerLineId, Date.now());
+  return true;
+}
+
+function checkDriverCooldown(driverLineId) {
+  const last = driverCooldown.get(driverLineId);
+  if (last && Date.now() - last < 3000) return false;
+  driverCooldown.set(driverLineId, Date.now());
+  return true;
+}
+
+ function parseStrictDriverMessage(text) {
+  const lines = String(text)
+    .split(/\n+/)
+    .map(v => v.trim())
+    .filter(Boolean);
+
+  if (lines.length < 2) return null;
+
+  const firstLine = lines[0];
+  const codeMatch = firstLine.match(/^(#[A-Z]\d+)/i);
+  if (!codeMatch) return null;
+
+  let orderCode = codeMatch[1].toUpperCase();
+  if (!orderCode.endsWith("/")) orderCode += "/";
+
+  const firstLineAddress = firstLine
+    .slice(codeMatch[1].length)
+    .replace(/^\//, "")
+    .trim();
+
+  const lastText = lines[lines.length - 1];
+  const plate = lines.length >= 3 ? lines[lines.length - 2] : "";
+
+  const normalizedLastText = chineseNumberToDigit(lastText);
+const isReservationAction =
+  lastText === "準" ||
+  /^(晚|慢)\d+$/.test(normalizedLastText) ||
+  normalizedLastText === "5";
+
+if (isReservationAction && lines.length < 3) {
+  return null;
+}
+
+if (isReservationAction && !plate) {
+  return null;
+}
+
+  let addressParts = [];
+
+  if (firstLineAddress) addressParts.push(firstLineAddress);
+
+  if (lines.length >= 4) {
+    addressParts = addressParts.concat(lines.slice(1, lines.length - 2));
+  }
+
+  const address = addressParts.join("").replace(/\s+/g, " ").trim();
+
+  if (!address) return null;
+
+  const minutesText = normalizedLastText
+  .replace("分鐘", "")
+  .replace("分", "")
+  .trim();
+
+  const minutes = Number(minutesText);
+
+  if (/^(晚|慢)\d+$/.test(normalizedLastText)) {
+    return {
+      type: "reservation_late",
+      orderCode,
+      address,
+      plate,
+      reservationText: lastText
+    };
+  }
+
+  if (lastText === "準") {
+    return {
+      type: "reservation_ready",
+      orderCode,
+      address,
+      plate,
+      reservationText: lastText
+    };
+  }
+
+  if (Number.isFinite(minutes) && minutes > 0) {
+    return {
+      type: "report",
+      orderCode,
+      address,
+      plate,
+      minutes
+    };
+  }
+
+  if (["到", "抵達", "到，客直上"].includes(lastText)) {
+    return {
+      type: "arrived",
+      orderCode,
+      address,
+      plate
+    };
+  }
+
+  if (["上", "客上", "客人直接上車"].includes(lastText)) {
+    return {
+      type: "customer_on",
+      orderCode,
+      address,
+      plate
+    };
+  }
+
+  return null;
+}
+
+async function rememberDriverOrder({ driverLineId, order, orderCode, address, plate, status = "assigned" }) {
+  return upsertDriverCurrentOrder({
+    driverLineId,
+    orderId: order.order_id,
+    orderCode,
+    address,
+    plate,
+    status
+  });
+}
+
+async function handleBotControl(event, text, clientObj) {
+  if (event.source.type !== "group") return false;
+
+  if (text === "停止機器人運作" || text === "停止") {
+    BOT_ENABLED = false;
+await setBotSetting("bot_enabled", "false");
+
+await supabase
+  .from("message_jobs")
+  .update({
+    next_retry_at: new Date(Date.now() + 60 * 60 * 1000).toISOString()
+  })
+  .eq("status", "pending");
+
+await replyText(clientObj, event.replyToken, "機器人已停止運作");
+return true;
+  }
+
+  if (text === "開始機器人運作" || text === "開始") {
+    BOT_ENABLED = true;
+    await setBotSetting("bot_enabled", "true");
+    await replyText(clientObj, event.replyToken, "機器人已開始運作");
+    return true;
+  }
+
+  if (text === "停止刷單") {
+    REFRESH_ENABLED = false;
+    await setBotSetting("refresh_enabled", "false");
+    await replyText(clientObj, event.replyToken, "刷單功能已停止");
+    return true;
+  }
+
+  if (text === "開始刷單") {
+    REFRESH_ENABLED = true;
+    await setBotSetting("refresh_enabled", "true");
+    await replyText(clientObj, event.replyToken, "刷單功能已開始");
+    return true;
+  }
+
+  if (text === "系統狀態") {
+    const { count: pendingJobs } = await supabase
+      .from("message_jobs")
+      .select("*", { count: "exact", head: true })
+      .eq("status", "pending");
+
+    await replyText(
+      clientObj,
+      event.replyToken,
+      `BOT:${BOT_ENABLED}
+REFRESH:${REFRESH_ENABLED}
+429:${total429}
+總訂單:${totalOrders}
+已取消:${totalCanceled}
+已派送:${totalAssigned}
+待送訊息:${pendingJobs || 0}
+GoogleAPI:${GOOGLE_API_ENABLED ? "ON" : "OFF"}`
+    );
+
+    return true;
+  }
+
+  return false;
+}
+
+function registerWebhook(path, config, sourceName) {
+  app.post(path, line.middleware(config), async (req, res) => {
+    res.status(200).end();
+
+    const events = req.body.events || [];
+    const item = clients.get(sourceName);
+
+    if (!item) {
+      console.error("Unknown webhook source:", sourceName);
+      return;
+    }
+
+  if (event.source?.type === "group") {
+    console.log("群組ID:", event.source.groupId);
+  }
+
+
+    for (const event of events) {
+      handleEvent(event, item.client, sourceName).catch(err => {
+        console.error(`${sourceName} error:`, err);
+      });
+    }
+  });
+}
+
+registerWebhook("/webhook", configA, "A");
+if (hasLineB) registerWebhook("/webhook-b", configB, "B");
+
+async function replyText(clientObj, replyToken, text) {
+  return clientObj.replyMessage(replyToken, {
+    type: "text",
+    text
+  });
+}
+
+async function replyMention(clientObj, replyToken, userId, text) {
+  return clientObj.replyMessage(replyToken, {
+    type: "textV2",
+    text: "{driver} " + text,
+    substitution: {
+      driver: {
+        type: "mention",
+        mentionee: {
+          type: "user",
+          userId
+        }
+      }
+    }
+  });
+}
+
+async function handleEvent(event, clientObj, source) {
+  console.log("EVENT:", source, event.type, JSON.stringify(event.source));
+
+  handleDriverAssistant(event).catch(err => {
+    console.error("driverAssistant async error:", err);
+  });
+
+  if (event.type === "join") {
+  console.log("JOIN GROUP:", source, event.source.groupId);
+  return;
+}
+
+  if (event.type !== "message") return;
+  if (event.message.type !== "text") return;
+
+  const text = event.message.text.trim();
+  if (!text) return;
+
+  if (event.source.type === "group") {
+    const controlled = await handleBotControl(event, text, clientObj);
+    if (controlled) return;
+
+    if (event.source.groupId !== DRIVER_GROUP_ID) return;
+    if (!BOT_ENABLED) return;
+
+    if (text === "可" || text === "不同意") {
+      const reservationReply = await handleReservationDriverReply(event, text, clientObj);
+      if (reservationReply) return;
+    }
+
+    if (!checkDriverCooldown(event.source.userId)) return;
+    if (!text.startsWith("#")) return;
+
+    const parsedStrict = parseStrictDriverMessage(text);
+
+    if (!parsedStrict) {
+      return replyMention(clientObj, event.replyToken, event.source.userId, "X");
+    }
+
+    return handleDriverReport(event, text, clientObj, parsedStrict);
+  }
+
+  if (event.source.type === "user") {
+    if (!BOT_ENABLED) return;
+    return handleCustomerOrder(event, text, clientObj, source);
+  }
+}
+
+async function handleCustomerOrder(event, addressText, clientObj, source) {
+  const customerLineId = event.source.userId;
+
+  if (blacklistCustomers.has(customerLineId)) {
+    return replyText(clientObj, event.replyToken, "您目前無法使用叫車");
+  }
+
+  if (!checkCustomerCooldown(customerLineId)) {
+    return replyText(clientObj, event.replyToken, "請稍後再試");
+  }
+
+  try {
+    if (processingOrders.has(customerLineId)) return;
+    processingOrders.add(customerLineId);
+
+    if (["取消", "取", "取消叫車", "不用車"].includes(addressText)) {
+      const canceledOrder = await cancelLatestCustomerOrder(customerLineId);
+      processingOrders.delete(customerLineId);
+
+      if (!canceledOrder) return replyText(clientObj, event.replyToken, "目前沒有可取消的訂單");
+
+      if (canceledOrder.assigned_driver_line_id) {
+        await queueGroupMention(
+          canceledOrder.assigned_driver_line_id,
+          "取",
+          canceledOrder.order_id,
+          PRIORITY_OVERRIDE_SPRAY
+        );
+      }
+
+      const currentFee = cancelFees.get(customerLineId) || 0;
+      cancelFees.set(customerLineId, currentFee + 100);
+      totalCanceled++;
+
+      return replyText(clientObj, event.replyToken, `已取消叫車\n取消費:${cancelFees.get(customerLineId)}`);
+    }
+
+    if (addressText === "取消付款設定") {
+      await upsertCustomerPreference(customerLineId, "");
+      processingOrders.delete(customerLineId);
+      return replyText(clientObj, event.replyToken, "已取消您的固定付款方式");
+    }
+
+const driverServiceText = parseDriverServiceOrder(addressText);
+
+if (driverServiceText) {
+  const order = await createOrder(
+    driverServiceText,
+    customerLineId,
+    source
+  );
+
+  totalOrders++;
+
+  processingOrders.delete(customerLineId);
+
+  await enqueueMessage({
+    toId: DRIVER_GROUP_ID,
+    sourceName: DRIVER_GROUP_SOURCE,
+    priority: PRIORITY_NEW_ORDER,
+    message: {
+      type: "text",
+      text: `${order.order_code}${order.address}`
+    }
+  });
+
+  return;
+}
+
+    const errandOrderText = parseErrandOrder(addressText);
+
+    if (errandOrderText) {
+      const order = await createOrder(errandOrderText, customerLineId, source);
+      totalOrders++;
+
+      processingOrders.delete(customerLineId);
+
+      await replyText(clientObj, event.replyToken, "已建立跑腿單");
+
+      await enqueueMessage({
+        toId: DRIVER_GROUP_ID,
+        sourceName: DRIVER_GROUP_SOURCE,
+        priority: PRIORITY_NEW_ORDER,
+        message: {
+          type: "text",
+          text: `${order.order_code}${order.address}`
+        }
+      });
+
+      return;
+    }
+
+    const paymentDetected = detectPaymentMethod(addressText);
+
+    if (paymentDetected) {
+      await upsertCustomerPreference(customerLineId, paymentDetected.value);
+      const cleanedAddress = removePaymentKeyword(addressText, paymentDetected.keyword);
+
+      if (cleanedAddress.length < 3) {
+        processingOrders.delete(customerLineId);
+        return replyText(clientObj, event.replyToken, `已記住您的付款方式:${paymentDetected.value}`);
+      }
+
+      addressText = cleanedAddress;
+    }
+
+    if (addressText.startsWith("改預約")) {
+      processingOrders.delete(customerLineId);
+      return handleCustomerChangeToReservation(event, addressText, clientObj);
+    }
+
+    if (addressText.length < 3) {
+      processingOrders.delete(customerLineId);
+      return replyText(clientObj, event.replyToken, "請輸入完整地址");
+    }
+
+    const order = await createOrder(addressText, customerLineId, source);
+    totalOrders++;
+
+    const preference = await getCustomerPreference(customerLineId);
+    const paymentText = preference && preference.payment_method ? ` ${preference.payment_method}` : "";
+
+    const fee = cancelFees.get(customerLineId) || 0;
+    const feeText = fee > 0 ? ` 代收取消費${fee}` : "";
+
+    processingOrders.delete(customerLineId);
+
+const groupText = `${order.order_code} ${order.address}${paymentText}${feeText}`;
+const pickupLocation = await geocodeAddress(order.address);
+const cleanOrderCode = order.order_code.replace("#", "").replace("/", "");
+
+await replyText(clientObj, event.replyToken, "立即為您派車");
+
+await Promise.all([
+  supabase
+    .from("driver_assistant_orders")
+    .upsert(
+      {
+        group_id: DRIVER_GROUP_ID,
+        order_code: cleanOrderCode,
+        raw_text: groupText,
+        address: order.address,
+        pickup_lat: pickupLocation ? pickupLocation.lat : null,
+        pickup_lng: pickupLocation ? pickupLocation.lng : null,
+        status: "open",
+        detected_from: "official_order",
+        updated_at: new Date().toISOString()
+      },
+      {
+        onConflict: "group_id,order_code"
+      }
+    ),
+
+  enqueueMessage({
+    toId: DRIVER_GROUP_ID,
+    sourceName: DRIVER_GROUP_SOURCE,
+    priority: PRIORITY_NEW_ORDER,
+    message: {
+      type: "text",
+      text: groupText
+    }
+  })
+]);
+
+  } catch (err) {
+    processingOrders.delete(customerLineId);
+    console.error("handleCustomerOrder error:", err);
+    await logSystemError("handleCustomerOrder", err);
+    return replyText(clientObj, event.replyToken, "系統忙碌中");
+  }
+  }
+
+
+async function handleCustomerChangeToReservation(event, text, clientObj) {
+  const parts = text.split(/\s+/);
+
+  if (parts.length < 2) {
+    return replyText(clientObj, event.replyToken, "格式錯誤\n例如：改預約 18:30");
+  }
+
+  const reservationTime = parts[1];
+  const order = await getLatestCustomerOrder(event.source.userId);
+
+  if (!order) return replyText(clientObj, event.replyToken, "找不到您目前的訂單");
+
+  const orderSource = order.source_name || "A";
+  const preference = await getCustomerPreference(event.source.userId);
+  const paymentText = preference && preference.payment_method ? ` ${preference.payment_method}` : "";
+
+  if (order.status !== "assigned" || !order.assigned_driver_line_id) {
+    await enqueueMessage({
+      toId: DRIVER_GROUP_ID,
+      sourceName: DRIVER_GROUP_SOURCE,
+      priority: PRIORITY_NEW_ORDER,
+      message: {
+        type: "text",
+        text: `${order.order_code} ${reservationTime} ${order.address}${paymentText}`
+      }
+    });
+
+    return replyText(clientObj, event.replyToken, `已改成預約單\n預約時間:${reservationTime}`);
+  }
+
+  pendingReservationChanges.set(order.order_code, {
+    order,
+    reservationTime,
+    address: order.address,
+    paymentText,
+    customerLineId: order.customer_line_id,
+    driverLineId: order.assigned_driver_line_id,
+    source: orderSource
+  });
+
+  await pushAskDriverReservationChange(order, reservationTime, paymentText);
+
+  return replyText(clientObj, event.replyToken, "已詢問司機是否可更改，請稍等");
+}
+
+async function handleReservationDriverReply(event, text, clientObj) {
+  const cleanText = text.trim();
+
+  if (cleanText !== "可" && cleanText !== "不同意") return false;
+
+  for (const [orderCode, pending] of pendingReservationChanges.entries()) {
+    if (pending.driverLineId !== event.source.userId) continue;
+
+    const orderSource = pending.source || "A";
+
+    if (cleanText === "可") {
+      pendingReservationChanges.delete(orderCode);
+
+      await pushCustomerReservationChanged(
+        pending.customerLineId,
+        pending.reservationTime,
+        orderSource
+      );
+
+      await replyMention(clientObj, event.replyToken, event.source.userId, "可");
+      return true;
+    }
+
+    if (cleanText === "不同意") {
+      pendingReservationChanges.delete(orderCode);
+
+      await replyMention(clientObj, event.replyToken, event.source.userId, "X");
+      await resetOrderForReDispatch(pending.order.order_id);
+
+      await enqueueMessage({
+        toId: DRIVER_GROUP_ID,
+        sourceName: DRIVER_GROUP_SOURCE,
+        priority: PRIORITY_NEW_ORDER,
+        message: {
+          type: "text",
+          text: `${pending.order.order_code} ${pending.reservationTime} ${pending.address}${pending.paymentText || ""}`
+        }
+      });
+
+      return true;
+    }
+  }
+
+  return false;
+}
+
+async function handleDriverReport(event, text, clientObj, parsedStrict = null) {
+  const parsed = parsedStrict || parseStrictDriverMessage(text);
+
+  if (!parsed) return replyMention(clientObj, event.replyToken, event.source.userId, "X");
+
+  const orderCode = parsed.orderCode;
+  const address = normalizeReportedAddress(parsed.address);
+  const plate = parsed.plate;
+  const minutes = Number(parsed.minutes);
+
+  let order = await getOrderByCodeAndAddress(orderCode, address);
+
+if (!order && (parsed.type === "reservation_late" || parsed.type === "reservation_ready")) {
+  order = await getOrderByCode(orderCode);
+}
+
+  if (!order) return replyMention(clientObj, event.replyToken, event.source.userId, "X");
+
+  const orderSource = order.source_name || "A";
+
+  if (order.status === "canceled") {
+    return replyMention(clientObj, event.replyToken, event.source.userId, "X");
+  }
+
+  if (parsed.type === "arrived") {
+    await upsertDriverCurrentOrder({
+      driverLineId: event.source.userId,
+      orderId: order.order_id,
+      orderCode,
+      address,
+      plate,
+      status: "arrived"
+    });
+
+    await pushCustomerArrived(order.customer_line_id, plate, orderSource);
+    return;
+  }
+
+  if (parsed.type === "customer_on") {
+    await upsertDriverCurrentOrder({
+      driverLineId: event.source.userId,
+      orderId: order.order_id,
+      orderCode,
+      address,
+      plate,
+      status: "customer_on"
+    });
+
+    return;
+  }
+
+ const orderAddress = `${order.order_code || ""}${order.address || ""}`;
+
+const isErrandReservation =
+  orderAddress.includes("/跑腿/") &&
+  /\d{1,2}:\d{2}/.test(orderAddress);
+
+const isNormalReservation =
+  orderAddress.includes("/預約/") &&
+  /\d{1,2}:\d{2}/.test(orderAddress);
+
+const isReservationOrder =
+  isErrandReservation || isNormalReservation;
+
+if (
+  isReservationOrder &&
+  (parsed.type === "reservation_late" || parsed.type === "reservation_ready")
+) {
+  const key = order.order_id;
+
+const lockInfo = await getReservationLock(order.order_id);
+
+if (
+  lockInfo &&
+  lockInfo.reservation_locked &&
+  lockInfo.reservation_driver !== event.source.userId
+) {
+  return replyMention(clientObj, event.replyToken, event.source.userId, "X");
+}
+
+  // 準：誰先報準誰贏
+  if (parsed.type === "reservation_ready") {
+    const existingReady = reservationReadyWinners.get(key);
+
+    if (existingReady) {
+      return replyMention(clientObj, event.replyToken, event.source.userId, "X");
+    }
+
+    reservationReadyWinners.set(key, {
+      driverLineId: event.source.userId,
+      plate,
+      reservationText: parsed.reservationText,
+      createdAt: Date.now()
+    });
+
+   await lockReservationWinner(
+  order.order_id,
+  event.source.userId,
+  "ready"
+);
+
+    const pending5 = reservationPending5.get(key);
+
+    if (pending5 && pending5.driverLineId !== event.source.userId) {
+      await queueGroupMention(
+        pending5.driverLineId,
+        "X",
+        order.order_id,
+        PRIORITY_OVERRIDE_SPRAY
+      );
+      reservationPending5.delete(key);
+    }
+
+    const updatedOrder = await overrideDriver({
+      order,
+      driverLineId: event.source.userId,
+      plate,
+      minutes: 0
+    });
+
+    await rememberDriverOrder({
+      driverLineId: event.source.userId,
+      order: updatedOrder,
+      orderCode,
+      address,
+      plate
+    });
+
+    await replyMention(clientObj, event.replyToken, event.source.userId, "噴");
+    await closeDriverAssistantOrder(orderCode);
+    await markSprayConfirmed(updatedOrder.order_id);
+    await pushCustomerDispatch(
+  updatedOrder.customer_line_id,
+  plate,
+  "準",
+  orderSource
+);
+
+await markCustomerDispatchNotified(updatedOrder.order_id);
+
+    totalAssigned++;
+    return;
+  }
+
+  // 晚5 / 報5：先等7秒
+  if (parsed.type === "reservation_late") {
+    const normalizedText = chineseNumberToDigit(parsed.reservationText);
+    const lateMatch = normalizedText.match(/^(晚|慢)(\d+)$/);
+const lateMinutes = lateMatch ? Number(lateMatch[2]) : null;
+
+if (
+  !Number.isFinite(lateMinutes) ||
+  lateMinutes < 1 ||
+  lateMinutes > 10
+) {
+  return replyMention(
+    clientObj,
+    event.replyToken,
+    event.source.userId,
+    "X"
+  );
+}
+
+    const existingReady = reservationReadyWinners.get(key);
+    if (existingReady) {
+      return replyMention(clientObj, event.replyToken, event.source.userId, "X");
+    }
+
+    const existingPending5 = reservationPending5.get(key);
+    if (existingPending5) {
+      return replyMention(clientObj, event.replyToken, event.source.userId, "X");
+    }
+
+    reservationPending5.set(key, {
+      driverLineId: event.source.userId,
+      plate,
+      reservationText: parsed.reservationText,
+      createdAt: Date.now()
+    });
+
+    setTimeout(async () => {
+      try {
+        const stillPending = reservationPending5.get(key);
+        const readyWinner = reservationReadyWinners.get(key);
+
+        if (!stillPending) return;
+        if (readyWinner) {
+          reservationPending5.delete(key);
+          return;
+        }
+
+        const updatedOrder = await overrideDriver({
+          order,
+          driverLineId: stillPending.driverLineId,
+          plate: stillPending.plate,
+          minutes: lateMinutes
+        });
+
+      await lockReservationWinner(
+  order.order_id,
+  stillPending.driverLineId,
+  `late${lateMinutes}`
+);
+
+        await rememberDriverOrder({
+          driverLineId: stillPending.driverLineId,
+          order: updatedOrder,
+          orderCode,
+          address,
+          plate: stillPending.plate
+        });
+
+       await queueGroupMention(
+  stillPending.driverLineId,
+  "噴",
+  order.order_id,
+  PRIORITY_COUNTDOWN_SPRAY
+);
+await closeDriverAssistantOrder(orderCode);
+await markSprayConfirmed(updatedOrder.order_id);
+
+
+        await pushCustomerDispatch(
+          updatedOrder.customer_line_id,
+          stillPending.plate,
+          `晚${lateMinutes}`,
+          orderSource
+        );
+
+        await markCustomerDispatchNotified(updatedOrder.order_id);
+
+        reservationPending5.delete(key);
+        totalAssigned++;
+      } catch (err) {
+        console.error("reservation pending5 error:", err);
+        reservationPending5.delete(key);
+      }
+    }, 7000);
+
+    return;
+  }
+} 
+
+if (isReservationOrder && parsed.type === "report") {
+  return replyMention(
+    clientObj,
+    event.replyToken,
+    event.source.userId,
+    "X"
+  );
+}
+const firstReportBeforeInstant = await getFirstDriverReport(order.order_id);
+
+if (
+  Number.isFinite(minutes) &&
+  minutes <= 5 &&
+  !firstReportBeforeInstant &&
+  !order.decision_started &&
+  order.status !== "assigned"
+) {
+  try {
+  await addDriverReport({
+    orderId: order.order_id,
+    orderCode,
+    address,
+    driverLineId: event.source.userId,
+    plate,
+    minutes
+  });
+} catch (err) {
+  if (err.code === "23505") {
+    return replyMention(clientObj, event.replyToken, event.source.userId, "X");
+  }
+  throw err;
+}
+
+    const updatedOrder = await overrideDriver({
+      order,
+      driverLineId: event.source.userId,
+      plate,
+      minutes
+    });
+
+    await rememberDriverOrder({
+      driverLineId: event.source.userId,
+      order: updatedOrder,
+      orderCode,
+      address,
+      plate
+    });
+
+    await replyMention(clientObj, event.replyToken, event.source.userId, "噴");
+    await closeDriverAssistantOrder(orderCode);
+    await markSprayConfirmed(updatedOrder.order_id);
+
+    await pushCustomerDispatch(
+      updatedOrder.customer_line_id,
+      plate,
+      minutes,
+      orderSource
+    );
+
+    await markCustomerDispatchNotified(updatedOrder.order_id);
+
+    totalAssigned++;
+    return;
+  }
+
+  const firstReport = await getFirstDriverReport(order.order_id);
+
+  if (firstReport && firstReport.driver_line_id !== event.source.userId) {
+    const firstArrival = getArrivalTimeMs(firstReport.created_at, firstReport.minutes);
+    const newArrival = Date.now() + minutes * 60 * 1000;
+    const diffMinutes = (firstArrival - newArrival) / 1000 / 60;
+
+    if (diffMinutes < COMPETE_DIFF_MINUTES) {
+      return replyMention(clientObj, event.replyToken, event.source.userId, "X");
+    }
+  }
+
+  try {
+    await addDriverReport({
+      orderId: order.order_id,
+      orderCode,
+      address,
+      driverLineId: event.source.userId,
+      plate,
+      minutes
+    });
+  } catch (err) {
+    if (err.code === "23505") {
+      return replyMention(clientObj, event.replyToken, event.source.userId, "X");
+    }
+
+    throw err;
+  }
+
+    if (
+  order.status === "assigned" &&
+  order.assigned_driver_line_id &&
+  order.assigned_minutes !== null &&
+  order.assigned_minutes !== undefined
+) {
+  const currentWinnerMinutes = Number(order.assigned_minutes);
+
+  if (currentWinnerMinutes - minutes >= OVERRIDE_DIFF_MINUTES) {
+    const oldDriverId = order.assigned_driver_line_id;
+
+    const updatedOrder = await overrideDriver({
+      order,
+      driverLineId: event.source.userId,
+      plate,
+      minutes
+    });
+
+    await queueGroupMention(
+      oldDriverId,
+      "X",
+      order.order_id,
+      PRIORITY_OVERRIDE_SPRAY
+    );
+
+    await queueGroupMention(
+      event.source.userId,
+      "噴",
+      updatedOrder.order_id,
+      PRIORITY_OVERRIDE_SPRAY
+    );
+    await closeDriverAssistantOrder(orderCode);
+    await markSprayConfirmed(updatedOrder.order_id);
+
+    await pushCustomerFasterDispatch(
+  updatedOrder.customer_line_id,
+  plate,
+  minutes,
+  orderSource
+);
+
+    await markCustomerDispatchNotified(updatedOrder.order_id);
+
+    totalAssigned++;
+    return;
+  }
+
+  return replyMention(clientObj, event.replyToken, event.source.userId, "X");
+}
+
+  if (!order.decision_started && !decidingOrders.has(order.order_id)) {
+    await assignWinnerDriver(order.order_id);
+
+    decidingOrders.add(order.order_id);
+
+    setTimeout(async () => {
+      if (!BOT_ENABLED) {
+        decidingOrders.delete(order.order_id);
+        return;
+      }
+
+      try {
+        const latestOrder = await getOrderByCode(orderCode);
+
+        if (!latestOrder || latestOrder.status === "canceled") {
+          decidingOrders.delete(order.order_id);
+          return;
+        }
+
+        const result = await decideWinner(order.order_id);
+
+        if (!result) return;
+
+        const {
+          order: assignedOrder,
+          winner,
+          losers
+        } = result;
+
+        const winnerSource = assignedOrder.source_name || orderSource || "A";
+
+        for (const loser of losers) {
+          await queueGroupMention(
+            loser.driver_line_id,
+            "X",
+            assignedOrder.order_id,
+            PRIORITY_COUNTDOWN_SPRAY
+          );
+        }
+
+        await queueGroupMention(
+          winner.driver_line_id,
+          "噴",
+          assignedOrder.order_id,
+          PRIORITY_COUNTDOWN_SPRAY
+        );
+
+        await closeDriverAssistantOrder(
+          assignedOrder.order_code
+        );
+
+        await markSprayConfirmed(assignedOrder.order_id);
+
+        await pushCustomerDispatch(
+          assignedOrder.customer_line_id,
+          winner.plate,
+          winner.minutes,
+          winnerSource
+        );
+
+        await markCustomerDispatchNotified(assignedOrder.order_id);
+
+        totalAssigned++;
+      } catch (err) {
+        console.error("decideWinner error:", err);
+        await logSystemError("decideWinner", err);
+      } finally {
+        decidingOrders.delete(order.order_id);
+      }
+    }, 8000);
+  }
+}
+
+async function repairMissingSprayJobs() {
+  try {
+    if (!BOT_ENABLED) return;
+
+    const { data: orders, error } = await supabase
+      .from("orders")
+      .select("*")
+      .eq("status", "assigned")
+      .not("assigned_driver_line_id", "is", null)
+      .not("assigned_plate", "is", null)
+      .not("assigned_minutes", "is", null)
+      .or("spray_confirmed.is.null,spray_confirmed.eq.false")
+      .gte("created_at", new Date(Date.now() - 2 * 60 * 1000).toISOString())
+      .limit(10);
+
+    if (error) throw error;
+    if (!orders || orders.length === 0) return;
+
+    for (const order of orders) {
+      await queueGroupMention(
+        order.assigned_driver_line_id,
+        "噴",
+        order.order_id,
+        PRIORITY_COUNTDOWN_SPRAY
+      );
+
+      await markSprayConfirmed(order.order_id);
+    }
+  } catch (err) {
+    console.error("repairMissingSprayJobs error:", err);
+    await logSystemError("repairMissingSprayJobs", err);
+  }
+}
+
+const AUTO_REPAIR_INTERVAL_MS = 30 * 1000;
+const BOT_AUTO_RECOVER_MS = 5 * 60 * 1000;
+let systemSlowMode = false;
+
+async function autoRepairSystem() {
+  try {
+    const now = new Date();
+
+    // 1. processing 卡住拉回 pending
+    const staleTime = new Date(Date.now() - 2 * 60 * 1000).toISOString();
+
+    await supabase
+      .from("message_jobs")
+      .update({
+        status: "pending",
+        locked_at: null,
+        next_retry_at: now.toISOString(),
+        error_message: "auto repaired stuck processing"
+      })
+      .eq("status", "processing")
+      .lt("locked_at", staleTime);
+
+    // 2. failed 訊息自動補送一次
+    await supabase
+      .from("message_jobs")
+      .update({
+        status: "pending",
+        locked_at: null,
+        next_retry_at: now.toISOString(),
+        error_message: "auto retry failed job"
+      })
+      .eq("status", "failed")
+      .lt("retry_count", MAX_RETRY);
+
+    // 3. 429 太多，自動暫停刷單，只保留重要訊息
+    if (total429 >= 3 && !systemSlowMode) {
+      systemSlowMode = true;
+      REFRESH_ENABLED = false;
+      await setBotSetting("refresh_enabled", "false");
+      await logSystemError("autoRepairSystem", "429 detected, refresh paused");
+    }
+
+    // 4. 429 冷卻後，自動恢復刷單
+    if (systemSlowMode && total429 === 0) {
+      systemSlowMode = false;
+      REFRESH_ENABLED = true;
+      await setBotSetting("refresh_enabled", "true");
+      await logSystemError("autoRepairSystem", "429 recovered, refresh resumed");
+    }
+
+    // 5. disabled BOT 5分鐘後自動復活
+    await supabase
+      .from("bot_accounts")
+      .update({
+        status: "active",
+        fail_count: 0,
+        last_error: null
+      })
+      .eq("status", "disabled")
+      .lt("disabled_at", new Date(Date.now() - BOT_AUTO_RECOVER_MS).toISOString());
+
+    // 6. 每次修復週期慢慢降低 429 計數，避免永久卡慢模式
+    if (total429 > 0) {
+      total429 = Math.max(0, total429 - 1);
+    }
+
+  } catch (err) {
+    console.error("autoRepairSystem error:", err);
+    await logSystemError("autoRepairSystem", err);
+  }
+}
+
+async function refreshOpenOrders() {
+  if (!BOT_ENABLED) return;
+  if (!REFRESH_ENABLED) return;
+
+  try {
+    const orders = await getOpenOrdersForRefresh();
+
+    if (!orders || orders.length === 0) return;
+
+    const refreshTargets = orders.slice(0, REFRESH_BATCH_SIZE);
+
+    await queueRefreshText(
+      DRIVER_GROUP_ID,
+      "🪳---🪳 我是分隔線 🪳---🪳",
+      DRIVER_GROUP_SOURCE
+    );
+
+    for (const order of refreshTargets) {
+      if (order.status === "canceled") continue;
+      if (refreshingOrders.has(order.order_id)) continue;
+
+      refreshingOrders.add(order.order_id);
+
+      const preference = await getCustomerPreference(order.customer_line_id);
+      const paymentText = preference && preference.payment_method ? ` ${preference.payment_method}` : "";
+
+      await queueRefreshText(
+        DRIVER_GROUP_ID,
+        `${order.order_code} ${order.address}${paymentText}`,
+        DRIVER_GROUP_SOURCE
+      );
+
+      await markOrderRefreshed(order.order_id);
+      refreshingOrders.delete(order.order_id);
+
+      await delay(REFRESH_ORDER_DELAY_MS);
+    }
+  } catch (err) {
+    refreshingOrders.clear();
+    console.error("refreshOpenOrders error:", err);
+    await logSystemError("refreshOpenOrders", err);
+  }
+}
+
+async function getWebStats() {
+  const { count: pendingJobs } = await supabase
+    .from("message_jobs")
+    .select("*", { count: "exact", head: true })
+    .eq("status", "pending");
+
+  const { count: failedJobs } = await supabase
+    .from("message_jobs")
+    .select("*", { count: "exact", head: true })
+    .eq("status", "failed");
+
+  const { count: processingJobs } = await supabase
+    .from("message_jobs")
+    .select("*", { count: "exact", head: true })
+    .eq("status", "processing");
+
+  return {
+    botEnabled: BOT_ENABLED,
+    refreshEnabled: REFRESH_ENABLED,
+    googleApi: GOOGLE_API_ENABLED,
+    officialA: true,
+    officialB: hasLineB,
+    totalOrders,
+    totalAssigned,
+    totalCanceled,
+    total429,
+    pendingJobs: pendingJobs || 0,
+    failedJobs: failedJobs || 0,
+    processingJobs: processingJobs || 0,
+    driverGroupId: DRIVER_GROUP_ID,
+    now: new Date().toLocaleString("zh-TW", { timeZone: "Asia/Taipei" })
+  };
+}
+
+function renderAdminPage(stats, message = "") {
+  const botBadge = stats.botEnabled ? "ON" : "OFF";
+  const refreshBadge = stats.refreshEnabled ? "ON" : "OFF";
+
+  return `
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>派單機器人控制台</title>
+  <style>
+    body {
+      margin: 0;
+      font-family: Arial, "Microsoft JhengHei", sans-serif;
+      background: #0f172a;
+      color: #e5e7eb;
+    }
+    .wrap {
+      max-width: 1100px;
+      margin: 0 auto;
+      padding: 28px;
+    }
+    .title {
+      font-size: 34px;
+      font-weight: 800;
+      margin-bottom: 8px;
+    }
+    .sub {
+      color: #94a3b8;
+      margin-bottom: 24px;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 16px;
+    }
+    .card {
+      background: #111827;
+      border: 1px solid #1f2937;
+      border-radius: 18px;
+      padding: 20px;
+      box-shadow: 0 12px 30px rgba(0,0,0,0.25);
+    }
+    .label {
+      color: #94a3b8;
+      font-size: 14px;
+      margin-bottom: 8px;
+    }
+    .value {
+      font-size: 30px;
+      font-weight: 800;
+    }
+    .ok { color: #22c55e; }
+    .bad { color: #ef4444; }
+    .warn { color: #f59e0b; }
+    .btns {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      margin-top: 22px;
+    }
+    button {
+      border: none;
+      border-radius: 14px;
+      padding: 14px 18px;
+      font-weight: 800;
+      cursor: pointer;
+      font-size: 15px;
+    }
+    .green { background: #22c55e; color: #052e16; }
+    .red { background: #ef4444; color: #450a0a; }
+    .blue { background: #38bdf8; color: #082f49; }
+    .yellow { background: #f59e0b; color: #451a03; }
+    .msg {
+      margin: 16px 0;
+      padding: 14px 16px;
+      background: #1e293b;
+      border-radius: 14px;
+      color: #bae6fd;
+    }
+    .footer {
+      margin-top: 26px;
+      color: #64748b;
+      font-size: 13px;
+      word-break: break-all;
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="title">🚕 派單機器人控制台</div>
+    <div class="sub">網頁版管理頁面｜狀態時間：${stats.now}</div>
+
+    ${message ? `<div class="msg">${message}</div>` : ""}
+
+    <div class="grid">
+      <div class="card">
+        <div class="label">機器人狀態</div>
+        <div class="value ${stats.botEnabled ? "ok" : "bad"}">${botBadge}</div>
+      </div>
+      <div class="card">
+        <div class="label">刷單狀態</div>
+        <div class="value ${stats.refreshEnabled ? "ok" : "bad"}">${refreshBadge}</div>
+      </div>
+      <div class="card">
+        <div class="label">待送訊息</div>
+        <div class="value warn">${stats.pendingJobs}</div>
+      </div>
+      <div class="card">
+        <div class="label">處理中訊息</div>
+        <div class="value">${stats.processingJobs}</div>
+      </div>
+      <div class="card">
+        <div class="label">失敗訊息</div>
+        <div class="value bad">${stats.failedJobs}</div>
+      </div>
+      <div class="card">
+        <div class="label">429 次數</div>
+        <div class="value bad">${stats.total429}</div>
+      </div>
+      <div class="card">
+        <div class="label">總訂單</div>
+        <div class="value">${stats.totalOrders}</div>
+      </div>
+      <div class="card">
+        <div class="label">已派送</div>
+        <div class="value ok">${stats.totalAssigned}</div>
+      </div>
+      <div class="card">
+        <div class="label">已取消</div>
+        <div class="value bad">${stats.totalCanceled}</div>
+      </div>
+      <div class="card">
+        <div class="label">官方A</div>
+        <div class="value ok">ON</div>
+      </div>
+      <div class="card">
+        <div class="label">官方B</div>
+        <div class="value ${stats.officialB ? "ok" : "bad"}">${stats.officialB ? "ON" : "OFF"}</div>
+      </div>
+      <div class="card">
+        <div class="label">Google API</div>
+        <div class="value ${stats.googleApi ? "ok" : "bad"}">${stats.googleApi ? "ON" : "OFF"}</div>
+      </div>
+    </div>
+
+    <div class="btns">
+      <form method="POST" action="/admin/action">
+        <input type="hidden" name="action" value="start_bot" />
+        <button class="green">開始機器人</button>
+      </form>
+      <form method="POST" action="/admin/action">
+        <input type="hidden" name="action" value="stop_bot" />
+        <button class="red">停止機器人</button>
+      </form>
+      <form method="POST" action="/admin/action">
+        <input type="hidden" name="action" value="start_refresh" />
+        <button class="blue">開始刷單</button>
+      </form>
+      <form method="POST" action="/admin/action">
+        <input type="hidden" name="action" value="stop_refresh" />
+        <button class="yellow">停止刷單</button>
+      </form>
+      <form method="GET" action="/">
+        <button class="blue">重新整理</button>
+      </form>
+    </div>
+
+    <div class="footer">
+      DRIVER_GROUP_ID：${stats.driverGroupId}<br/>
+      Webhook A：/webhook<br/>
+      Webhook B：/webhook-b
+    </div>
+  </div>
+</body>
+</html>
+`;
+}
+
+app.get("/", async (req, res) => {
+  try {
+    const stats = await getWebStats();
+    res.send(renderAdminPage(stats));
+  } catch (err) {
+    console.error("web page error:", err);
+    res.status(500).send("控制台讀取失敗");
+  }
+});
+
+app.get("/admin/status.json", async (req, res) => {
+  try {
+    const stats = await getWebStats();
+    res.json(stats);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post("/admin/action", async (req, res) => {
+  try {
+    const action = req.body.action;
+    let message = "";
+
+    if (action === "start_bot") {
+      BOT_ENABLED = true;
+      await setBotSetting("bot_enabled", "true");
+      message = "機器人已開始運作";
+    }
+
+    if (action === "stop_bot") {
+      BOT_ENABLED = false;
+      await setBotSetting("bot_enabled", "false");
+      message = "機器人已停止運作";
+    }
+
+    if (action === "start_refresh") {
+      REFRESH_ENABLED = true;
+      await setBotSetting("refresh_enabled", "true");
+      message = "刷單功能已開始";
+    }
+
+    if (action === "stop_refresh") {
+      REFRESH_ENABLED = false;
+      await setBotSetting("refresh_enabled", "false");
+      message = "刷單功能已停止";
+    }
+
+    const stats = await getWebStats();
+    res.send(renderAdminPage(stats, message || "已執行"));
+  } catch (err) {
+    console.error("admin action error:", err);
+    res.status(500).send("操作失敗");
+  }
+});
+
+setInterval(processMessageJobs, MESSAGE_WORKER_INTERVAL_MS);
+setInterval(refreshOpenOrders, REFRESH_INTERVAL_MS);
+setInterval(repairMissingSprayJobs, RESPRAY_CHECK_INTERVAL_MS);
+setInterval(autoRepairSystem, AUTO_REPAIR_INTERVAL_MS);
+
+setInterval(() => {
+  console.log(`429:${total429}\nGoogleAPI:${GOOGLE_API_ENABLED ? "ON" : "OFF"}`);
+}, 5 * 60 * 1000);
+
+async function loadBotSettings() {
+  const botEnabled = await getBotSetting("bot_enabled");
+  const refreshEnabled = await getBotSetting("refresh_enabled");
+
+  BOT_ENABLED = botEnabled !== "false";
+  REFRESH_ENABLED = refreshEnabled !== "false";
+}
+
+const port = process.env.PORT || 3000;
+
+loadBotSettings()
+  .catch(err => {
+    console.error("loadBotSettings error:", err);
+    console.log("使用預設設定啟動：BOT_ENABLED=true, REFRESH_ENABLED=true");
+    BOT_ENABLED = true;
+    REFRESH_ENABLED = true;
+  })
+  .then(() => {
+    app.listen(port, () => {
+      console.log("BOT RUNNING:", port);
+      console.log("官方A: ON");
+      console.log("官方B:", hasLineB ? "ON" : "OFF");
+      console.log("Supabase message_jobs: ON");
+      console.log("Web admin page: ON");
+      console.log("Priority: 5min instant > 3min > 7min > countdown");
+      console.log("Google API:", GOOGLE_API_ENABLED ? "ON" : "OFF");
+    });
+  });
