@@ -926,12 +926,11 @@ function registerWebhook(path, config, sourceName) {
       return;
     }
 
-  if (event.source?.type === "group") {
-    console.log("群組ID:", event.source.groupId);
-  }
-
-
     for (const event of events) {
+      if (event.source?.type === "group") {
+        console.log("群組ID:", event.source.groupId);
+      }
+
       handleEvent(event, item.client, sourceName).catch(err => {
         console.error(`${sourceName} error:`, err);
       });
